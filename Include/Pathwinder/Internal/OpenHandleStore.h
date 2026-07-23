@@ -49,6 +49,13 @@ namespace Pathwinder
       std::set<std::wstring, Infra::Strings::CaseInsensitiveLessThanComparator<wchar_t>>
           enumeratedFilenames;
 
+      /// Base filenames hidden from this enumeration by an active tombstone, that is, a whiteout
+      /// marker present on the target side with no live file of the same base name behind it.
+      /// Populated once when the enumeration state is first created. Any filename in this set, as
+      /// well as any whiteout marker filename itself, is skipped during enumeration output.
+      std::set<std::wstring, Infra::Strings::CaseInsensitiveLessThanComparator<wchar_t>>
+          hiddenFilenames;
+
       /// Whether or not to enable special behavior for the first invocation of a directory
       /// enumeration function, as specified by `NtQueryDirectoryFileEx` documentation.
       bool isFirstInvocation;

@@ -13,8 +13,11 @@
 #pragma once
 
 #include <cstdint>
+#include <set>
+#include <string>
 #include <string_view>
 
+#include <Infra/Core/Strings.h>
 #include <Infra/Core/TemporaryBuffer.h>
 #include <Infra/Core/ValueOrError.h>
 
@@ -43,6 +46,43 @@ namespace Pathwinder
     /// @return System call return code indicating the result of the operation.
     NTSTATUS CopySingleFile(
         std::wstring_view absoluteSourcePath, std::wstring_view absoluteDestinationPath);
+
+    /// Filename suffix that identifies a whiteout (tombstone) marker. A zero-length file whose
+    /// name is a real filename with this suffix appended records that the same-named file, as it
+    /// would otherwise be resolved on the origin side (for example, C:), is logically deleted in
+    /// the overlay. The marker is created on the target side (for example, D:) next to where the
+    /// effective file would live. Its semantics are latent: while a real target-side file with
+    /// the base name exists, the marker is inert (the file is live); the instant that target-side
+    /// file is deleted (by any means), the marker takes effect and hides the origin-side file.
+    inline constexpr std::wstring_view kWhiteoutFilenameSuffix = L".__pw_wh__";
+
+    /// Determines whether the specified filename (a single path component, not a full path) is a
+    /// whiteout marker filename, that is, whether it ends with the whiteout filename suffix.
+    /// @param [in] filename Single-component filename to test.
+    /// @return `true` if the filename is a whiteout marker filename, `false` otherwise.
+    inline bool IsWhiteoutFilename(std::wstring_view filename)
+    {
+      return filename.ends_with(kWhiteoutFilenameSuffix);
+    }
+
+    /// Creates a zero-length file at the specified absolute path, creating any missing ancestor
+    /// directories, and overwriting any existing file. Used to place whiteout markers. Bypasses
+    /// Pathwinder's own hooks, so it is safe to call from within redirection logic.
+    /// @param [in] absolutePath Absolute path of the zero-length file to create.
+    /// @return System call return code indicating the result of the operation.
+    NTSTATUS CreateEmptyFile(std::wstring_view absolutePath);
+
+    /// Scans a directory for active tombstones. A tombstone is active when a whiteout marker file
+    /// (a file whose name ends with the whiteout suffix) is present but the corresponding base
+    /// file (the marker filename with the suffix removed) is not, meaning the base name is
+    /// logically deleted in the overlay. Bypasses Pathwinder's own hooks, so it is safe to call
+    /// from within redirection logic. Returns the base filenames (single path components) that
+    /// are actively tombstoned. If the directory does not exist or contains no markers, the
+    /// returned container is empty.
+    /// @param [in] absoluteDirectoryPath Absolute path of the directory to scan.
+    /// @return Set of actively-tombstoned base filenames found in the directory.
+    std::set<std::wstring, Infra::Strings::CaseInsensitiveLessThanComparator<wchar_t>>
+        FindActiveTombstones(std::wstring_view absoluteDirectoryPath);
 
     /// Attempts to create the specified directory if it does not already exist.
     /// If needed, also attempts to create all directories that are ancestors of the specified

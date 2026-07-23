@@ -404,6 +404,23 @@ namespace Pathwinder
       const bool isFirstInvocation = enumerationState.isFirstInvocation;
       enumerationState.isFirstInvocation = false;
 
+      // A queue-front filename must be skipped (not emitted to the application) if it is a
+      // whiteout marker itself or if it is a base name hidden by an active tombstone. This hides
+      // logically-deleted files and the marker files that record their deletion from directory
+      // listings, mirroring the hide-on-open behavior applied to file opens.
+      const auto frontIsHidden = [&enumerationState]() -> bool
+      {
+        const std::wstring_view frontName = enumerationState.queue->FileNameOfFront();
+        return (true == FilesystemOperations::IsWhiteoutFilename(frontName)) ||
+            (enumerationState.hiddenFilenames.contains(frontName));
+      };
+
+      // Advance past any hidden or whiteout entries at the front of the queue before enumeration
+      // proceeds. On the first invocation the queue has not been pre-advanced, and after a
+      // restart it may sit on a hidden entry, so this must run before the status check below.
+      while ((NT_SUCCESS(enumerationState.queue->EnumerationStatus())) && (true == frontIsHidden()))
+        enumerationState.queue->PopFront();
+
       // This block will cause `STATUS_NO_MORE_FILES` to be returned if the queue is empty and
       // enumeration is complete. Getting past here means the queue is not empty and more files
       // can be enumerated.
@@ -484,10 +501,12 @@ namespace Pathwinder
 
         // Enumeration status must be checked first because, if there are no file information
         // structures left in the queue, checking the front element's filename will cause a
-        // crash.
+        // crash. In addition to deduplication, skip whiteout marker files and any base names
+        // hidden by an active tombstone so logically-deleted files never appear in the listing.
         while ((NT_SUCCESS(enumerationState.queue->EnumerationStatus())) &&
-               (enumerationState.enumeratedFilenames.contains(
-                   enumerationState.queue->FileNameOfFront())))
+               ((enumerationState.enumeratedFilenames.contains(
+                    enumerationState.queue->FileNameOfFront())) ||
+                (true == frontIsHidden())))
           enumerationState.queue->PopFront();
 
         enumerationStatus = enumerationState.queue->EnumerationStatus();
@@ -1437,6 +1456,17 @@ namespace Pathwinder
         // Re-obtain the handle data so that it contains a pointer to the newly-created directory
         // enumeration state object.
         maybeHandleData = openHandleStore.GetDataForHandle(fileHandle);
+
+        // Pre-scan the actually-opened (target-side) directory for active tombstones. Whiteout
+        // markers only ever live on the target side, so scanning the real opened path finds them
+        // when the target-side directory exists and finds none otherwise. Any actively-tombstoned
+        // base name, and any whiteout marker filename itself, is hidden from enumeration output.
+        if ((true == maybeHandleData.has_value()) &&
+            (true == maybeHandleData->directoryEnumeration.has_value()))
+        {
+          (*(*maybeHandleData->directoryEnumeration)).hiddenFilenames =
+              FilesystemOperations::FindActiveTombstones(maybeHandleData->realOpenedPath);
+        }
       }
 
       // A `nullptr` queue, either just created or already cached, indicates that the directory

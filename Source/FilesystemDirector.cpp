@@ -758,52 +758,121 @@ namespace Pathwinder
       }
     }
 
-    // Copy-up: when a write or delete is requested against a file that currently exists only on
-    // the origin side (for example, C:) and not on the target side (for example, D:), first copy
-    // the origin-side file to the target side. Combined with restricting the operation to the
-    // target side only (in the Overlay case below), this guarantees that a write or delete never
-    // modifies the origin side. Applies only to Overlay-mode rules and only to regular files,
-    // never directories (target-side directories are handled by EnsurePathHierarchyExists above).
     const bool writeOrDeleteIntent =
         (true == fileAccessMode.AllowsWrite()) || (true == fileAccessMode.AllowsDelete());
 
+    // Overlay-mode copy-up and tombstone (whiteout) handling. This runs for any real file (not
+    // the origin directory itself) covered by an Overlay-mode rule. It provides three things:
+    //   1. Hide-on-open: a file logically deleted in the overlay (an active whiteout) is never
+    //      resolved from the origin side; opens see file-not-found and creates lift the tombstone.
+    //   2. Copy-up: a write/delete-intent operation on an origin-only file first copies it to the
+    //      target side, so the origin side is never modified (combined with target-only
+    //      redirection in the Overlay case below).
+    //   3. Whiteout creation: a delete-capable operation on a file present on the origin side
+    //      drops a latent whiteout marker. The marker is inert while the target-side file exists
+    //      and becomes an active tombstone the moment that file is deleted by any means
+    //      (delete-on-close, disposition-delete, rename-away, or by-name delete), at which point
+    //      the origin-side file stops being visible.
     if ((ERedirectMode::Overlay == selectedRule->GetRedirectMode()) &&
-        (true == writeOrDeleteIntent))
+        (false == unredirectedPathFilePart.empty()))
     {
       const std::wstring_view redirectedFilePathTrimmed =
           Infra::Strings::RemoveTrailing(redirectedFilePath, L'\\');
       const std::wstring_view unredirectedFilePathTrimmed =
           Infra::Strings::RemoveTrailing(absoluteFilePath, L'\\');
 
-      if ((false == FilesystemOperations::Exists(redirectedFilePathTrimmed)) &&
-          (true == FilesystemOperations::Exists(unredirectedFilePathTrimmed)) &&
-          (false == FilesystemOperations::IsDirectory(unredirectedFilePathTrimmed)))
+      Infra::TemporaryString whiteoutPath;
+      whiteoutPath << redirectedFilePathTrimmed << FilesystemOperations::kWhiteoutFilenameSuffix;
+
+      const bool redirectedExists = FilesystemOperations::Exists(redirectedFilePathTrimmed);
+      const bool whiteoutExists = FilesystemOperations::Exists(whiteoutPath.AsStringView());
+
+      // An active tombstone: a whiteout marker with no live target-side file behind it. The
+      // origin-side file (if any) is logically deleted and must not be resolved.
+      const bool tombstoned = (true == whiteoutExists) && (false == redirectedExists);
+
+      if (true == tombstoned)
       {
-        NTSTATUS copyUpResult = FilesystemOperations::CopySingleFile(
-            unredirectedFilePathTrimmed, redirectedFilePathTrimmed);
-        if (NT_SUCCESS(copyUpResult))
+        if (true == createDisposition.AllowsCreateNewFile())
         {
+          // The application is (re)creating a previously-deleted file. Lift the tombstone and
+          // let normal target-side creation proceed below.
+          FilesystemOperations::Delete(whiteoutPath.AsStringView());
           Infra::Message::OutputFormatted(
               Infra::Message::ESeverity::Info,
-              L"File operation redirection query for path \"%.*s\" triggered copy-up to \"%.*s\" ahead of a write or delete.",
+              L"File operation redirection query for path \"%.*s\" lifted a tombstone because the application is creating the file anew.",
               static_cast<int>(absoluteFilePath.length()),
-              absoluteFilePath.data(),
-              static_cast<int>(redirectedFilePathTrimmed.length()),
-              redirectedFilePathTrimmed.data());
+              absoluteFilePath.data());
         }
         else
         {
-          // Even if copy-up fails, still fall through to target-only redirection below so the
-          // origin side is never opened for writing. The application will observe whatever error
-          // results from operating on the target side.
+          // The file is logically deleted and the application only wants to open an existing
+          // file. Restrict to the (non-existent) target side so the result is file-not-found and
+          // the origin side is never consulted.
           Infra::Message::OutputFormatted(
-              Infra::Message::ESeverity::Warning,
-              L"File operation redirection query for path \"%.*s\" attempted copy-up to \"%.*s\" but it failed with code 0x%08x; the operation will proceed on the target side only.",
+              Infra::Message::ESeverity::Info,
+              L"File operation redirection query for path \"%.*s\" resolved to a tombstone; reporting file-not-found without consulting the origin side.",
+              static_cast<int>(absoluteFilePath.length()),
+              absoluteFilePath.data());
+          return FileOperationInstruction::SimpleRedirectTo(
+              std::move(*maybeRedirectedFilePath),
+              EAssociateNameWithHandle::Unredirected,
+              std::move(extraPreOperations),
+              extraPreOperationOperand);
+        }
+      }
+
+      if (true == writeOrDeleteIntent)
+      {
+        // Copy-up. Skipped when tombstoned so a logically-deleted path is never resurrected from
+        // origin content, and skipped for directories (handled by EnsurePathHierarchyExists).
+        if ((false == redirectedExists) && (false == tombstoned) &&
+            (true == FilesystemOperations::Exists(unredirectedFilePathTrimmed)) &&
+            (false == FilesystemOperations::IsDirectory(unredirectedFilePathTrimmed)))
+        {
+          NTSTATUS copyUpResult = FilesystemOperations::CopySingleFile(
+              unredirectedFilePathTrimmed, redirectedFilePathTrimmed);
+          if (NT_SUCCESS(copyUpResult))
+          {
+            Infra::Message::OutputFormatted(
+                Infra::Message::ESeverity::Info,
+                L"File operation redirection query for path \"%.*s\" triggered copy-up to \"%.*s\" ahead of a write or delete.",
+                static_cast<int>(absoluteFilePath.length()),
+                absoluteFilePath.data(),
+                static_cast<int>(redirectedFilePathTrimmed.length()),
+                redirectedFilePathTrimmed.data());
+          }
+          else
+          {
+            // Even if copy-up fails, still fall through to target-only redirection below so the
+            // origin side is never opened for writing. The application will observe whatever
+            // error results from operating on the target side.
+            Infra::Message::OutputFormatted(
+                Infra::Message::ESeverity::Warning,
+                L"File operation redirection query for path \"%.*s\" attempted copy-up to \"%.*s\" but it failed with code 0x%08x; the operation will proceed on the target side only.",
+                static_cast<int>(absoluteFilePath.length()),
+                absoluteFilePath.data(),
+                static_cast<int>(redirectedFilePathTrimmed.length()),
+                redirectedFilePathTrimmed.data(),
+                static_cast<unsigned int>(copyUpResult));
+          }
+        }
+
+        // Drop a latent whiteout marker when a delete-capable operation targets a file that is
+        // present on the origin side. Only origin-present files need a tombstone, because a file
+        // that exists only on the target side leaves nothing behind to hide when deleted.
+        if ((true == fileAccessMode.AllowsDelete()) &&
+            (true == FilesystemOperations::Exists(unredirectedFilePathTrimmed)))
+        {
+          NTSTATUS whiteoutResult =
+              FilesystemOperations::CreateEmptyFile(whiteoutPath.AsStringView());
+          Infra::Message::OutputFormatted(
+              Infra::Message::ESeverity::Info,
+              L"File operation redirection query for path \"%.*s\" armed a latent whiteout at \"%s\" (result 0x%08x); it will hide the origin-side file if the target-side file is deleted.",
               static_cast<int>(absoluteFilePath.length()),
               absoluteFilePath.data(),
-              static_cast<int>(redirectedFilePathTrimmed.length()),
-              redirectedFilePathTrimmed.data(),
-              static_cast<unsigned int>(copyUpResult));
+              whiteoutPath.AsCString(),
+              static_cast<unsigned int>(whiteoutResult));
         }
       }
     }

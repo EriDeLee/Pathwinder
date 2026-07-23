@@ -426,6 +426,118 @@ namespace Pathwinder
       return copyResult;
     }
 
+    NTSTATUS CreateEmptyFile(std::wstring_view absolutePath)
+    {
+      ENSURE_ABSOLUTE_PATH_PARAM_HAS_WINDOWS_NAMESPCE_PREFIX(absolutePath);
+
+      // Ensure the parent directory hierarchy exists before creating the file.
+      const std::wstring_view trimmed = Infra::Strings::RemoveTrailing(absolutePath, L'\\');
+      const size_t lastSeparator = trimmed.find_last_of(L'\\');
+      if (std::wstring_view::npos != lastSeparator)
+      {
+        NTSTATUS createParentResult = CreateDirectoryHierarchy(trimmed.substr(0, lastSeparator));
+        if (!(NT_SUCCESS(createParentResult))) return createParentResult;
+      }
+
+      UNICODE_STRING pathSystemString = Strings::NtConvertStringViewToUnicodeString(absolutePath);
+      OBJECT_ATTRIBUTES pathObjectAttributes{};
+      InitializeObjectAttributes(&pathObjectAttributes, &pathSystemString, 0, nullptr, nullptr);
+
+      HANDLE fileHandle = nullptr;
+      IO_STATUS_BLOCK statusBlock{};
+      NTSTATUS createResult = Hooks::ProtectedDependency::NtCreateFile::SafeInvoke(
+          &fileHandle,
+          (FILE_WRITE_DATA | SYNCHRONIZE),
+          &pathObjectAttributes,
+          &statusBlock,
+          nullptr,
+          FILE_ATTRIBUTE_NORMAL,
+          (FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE),
+          FILE_OVERWRITE_IF,
+          (FILE_NON_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT),
+          nullptr,
+          0);
+      if (NT_SUCCESS(createResult))
+        Hooks::ProtectedDependency::NtClose::SafeInvoke(fileHandle);
+
+      return createResult;
+    }
+
+    std::set<std::wstring, Infra::Strings::CaseInsensitiveLessThanComparator<wchar_t>>
+        FindActiveTombstones(std::wstring_view absoluteDirectoryPath)
+    {
+      std::set<std::wstring, Infra::Strings::CaseInsensitiveLessThanComparator<wchar_t>>
+          activeTombstones;
+
+      auto maybeDirectoryHandle = OpenDirectoryForEnumeration(absoluteDirectoryPath);
+      if (true == maybeDirectoryHandle.HasError()) return activeTombstones;
+      HANDLE directoryHandle = maybeDirectoryHandle.Value();
+
+      // First pass: collect the base names of every whiteout marker in the directory. Only the
+      // markers (files whose names end with the whiteout suffix) are matched, via a file pattern,
+      // to avoid transferring the entire directory listing.
+      std::set<std::wstring, Infra::Strings::CaseInsensitiveLessThanComparator<wchar_t>>
+          markerBaseNames;
+
+      Infra::TemporaryString markerPattern;
+      markerPattern << L"*" << kWhiteoutFilenameSuffix;
+
+      Infra::TemporaryBuffer<uint8_t> enumerationBuffer;
+      bool restartScan = true;
+      while (true)
+      {
+        UNICODE_STRING patternSystemString =
+            Strings::NtConvertStringViewToUnicodeString(markerPattern.AsStringView());
+        IO_STATUS_BLOCK statusBlock{};
+        NTSTATUS enumResult = Hooks::ProtectedDependency::NtQueryDirectoryFileEx::SafeInvoke(
+            directoryHandle,
+            NULL,
+            NULL,
+            NULL,
+            &statusBlock,
+            enumerationBuffer.Data(),
+            enumerationBuffer.CapacityBytes(),
+            SFileNamesInformation::kFileInformationClass,
+            0,
+            (true == restartScan) ? &patternSystemString : nullptr);
+        restartScan = false;
+        if (!(NT_SUCCESS(enumResult))) break;
+
+        const uint8_t* cursor = enumerationBuffer.Data();
+        while (true)
+        {
+          const SFileNamesInformation* entry =
+              reinterpret_cast<const SFileNamesInformation*>(cursor);
+          const std::wstring_view filename(
+              entry->fileName, entry->fileNameLength / sizeof(wchar_t));
+
+          if ((true == IsWhiteoutFilename(filename)) &&
+              (filename.length() > kWhiteoutFilenameSuffix.length()))
+          {
+            markerBaseNames.emplace(
+                filename.substr(0, filename.length() - kWhiteoutFilenameSuffix.length()));
+          }
+
+          if (0 == entry->nextEntryOffset) break;
+          cursor += entry->nextEntryOffset;
+        }
+      }
+
+      // Second pass: a marker is an active tombstone only if the base file it shadows does not
+      // currently exist on the target side. If the base file exists, the marker is inert.
+      const std::wstring_view directoryTrimmed =
+          Infra::Strings::RemoveTrailing(absoluteDirectoryPath, L'\\');
+      for (const auto& baseName : markerBaseNames)
+      {
+        Infra::TemporaryString baseFilePath;
+        baseFilePath << directoryTrimmed << L"\\" << baseName;
+        if (false == Exists(baseFilePath.AsStringView())) activeTombstones.emplace(baseName);
+      }
+
+      Hooks::ProtectedDependency::NtClose::SafeInvoke(directoryHandle);
+      return activeTombstones;
+    }
+
     NTSTATUS CreateDirectoryHierarchy(std::wstring_view absoluteDirectoryPath)
     {
       const std::wstring_view windowsNamespacePrefix =
