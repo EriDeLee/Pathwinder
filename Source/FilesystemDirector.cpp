@@ -758,6 +758,56 @@ namespace Pathwinder
       }
     }
 
+    // Copy-up: when a write or delete is requested against a file that currently exists only on
+    // the origin side (for example, C:) and not on the target side (for example, D:), first copy
+    // the origin-side file to the target side. Combined with restricting the operation to the
+    // target side only (in the Overlay case below), this guarantees that a write or delete never
+    // modifies the origin side. Applies only to Overlay-mode rules and only to regular files,
+    // never directories (target-side directories are handled by EnsurePathHierarchyExists above).
+    const bool writeOrDeleteIntent =
+        (true == fileAccessMode.AllowsWrite()) || (true == fileAccessMode.AllowsDelete());
+
+    if ((ERedirectMode::Overlay == selectedRule->GetRedirectMode()) &&
+        (true == writeOrDeleteIntent))
+    {
+      const std::wstring_view redirectedFilePathTrimmed =
+          Infra::Strings::RemoveTrailing(redirectedFilePath, L'\\');
+      const std::wstring_view unredirectedFilePathTrimmed =
+          Infra::Strings::RemoveTrailing(absoluteFilePath, L'\\');
+
+      if ((false == FilesystemOperations::Exists(redirectedFilePathTrimmed)) &&
+          (true == FilesystemOperations::Exists(unredirectedFilePathTrimmed)) &&
+          (false == FilesystemOperations::IsDirectory(unredirectedFilePathTrimmed)))
+      {
+        NTSTATUS copyUpResult = FilesystemOperations::CopySingleFile(
+            unredirectedFilePathTrimmed, redirectedFilePathTrimmed);
+        if (NT_SUCCESS(copyUpResult))
+        {
+          Infra::Message::OutputFormatted(
+              Infra::Message::ESeverity::Info,
+              L"File operation redirection query for path \"%.*s\" triggered copy-up to \"%.*s\" ahead of a write or delete.",
+              static_cast<int>(absoluteFilePath.length()),
+              absoluteFilePath.data(),
+              static_cast<int>(redirectedFilePathTrimmed.length()),
+              redirectedFilePathTrimmed.data());
+        }
+        else
+        {
+          // Even if copy-up fails, still fall through to target-only redirection below so the
+          // origin side is never opened for writing. The application will observe whatever error
+          // results from operating on the target side.
+          Infra::Message::OutputFormatted(
+              Infra::Message::ESeverity::Warning,
+              L"File operation redirection query for path \"%.*s\" attempted copy-up to \"%.*s\" but it failed with code 0x%08x; the operation will proceed on the target side only.",
+              static_cast<int>(absoluteFilePath.length()),
+              absoluteFilePath.data(),
+              static_cast<int>(redirectedFilePathTrimmed.length()),
+              redirectedFilePathTrimmed.data(),
+              static_cast<unsigned int>(copyUpResult));
+        }
+      }
+    }
+
     switch (selectedRule->GetRedirectMode())
     {
       case ERedirectMode::Overlay:
@@ -775,6 +825,21 @@ namespace Pathwinder
         // origin side. It is up to the caller to interpret the combination of
         // preference, which is encoded in the returned instruction, and create
         // disposition, which is supplied by the application.
+
+        // Write/delete isolation: a modifying operation must never be allowed to fall through
+        // to the origin side. Copy-up above has already materialized any origin-only file on the
+        // target side, so restricting the operation to the target side only (as in Simple mode)
+        // both preserves correct behavior and guarantees the origin side is never written. Reads
+        // keep the standard Overlay behavior of trying the target side first and then the origin
+        // side, so origin-only files remain readable.
+        if (true == writeOrDeleteIntent)
+        {
+          return FileOperationInstruction::SimpleRedirectTo(
+              std::move(*maybeRedirectedFilePath),
+              EAssociateNameWithHandle::Unredirected,
+              std::move(extraPreOperations),
+              extraPreOperationOperand);
+        }
 
         const ECreateDispositionPreference createDispositionPreference =
             ((true == createDisposition.AllowsCreateNewFile())

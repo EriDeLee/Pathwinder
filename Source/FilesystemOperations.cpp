@@ -13,8 +13,10 @@
 #include "FilesystemOperations.h"
 
 #include <bitset>
+#include <cstdint>
 #include <cwctype>
 #include <limits>
+#include <memory>
 #include <optional>
 #include <string_view>
 
@@ -226,6 +228,202 @@ namespace Pathwinder
     NTSTATUS CloseHandle(HANDLE handle)
     {
       return Hooks::ProtectedDependency::NtClose::SafeInvoke(handle);
+    }
+
+    NTSTATUS CopySingleFile(
+        std::wstring_view absoluteSourcePath, std::wstring_view absoluteDestinationPath)
+    {
+      // `STATUS_END_OF_FILE`: The end-of-file marker has been reached. Not defined in available
+      // headers. Reported by `NtReadFile` once all bytes have been consumed.
+      constexpr NTSTATUS kEndOfFile = 0xC0000011;
+
+      // `NtReadFile` and `NtWriteFile` are not among the hooked functions (they operate on an
+      // already-open handle and therefore require no path redirection), so they are resolved
+      // directly from ntdll and invoked without any interception. Everything else uses the
+      // protected-dependency SafeInvoke path, which targets the original (pre-hook) function and
+      // is thus recursion-safe when called from inside redirection logic.
+      using TNtReadWriteFile = NTSTATUS(__stdcall*)(
+          HANDLE,
+          HANDLE,
+          PIO_APC_ROUTINE,
+          PVOID,
+          PIO_STATUS_BLOCK,
+          PVOID,
+          ULONG,
+          PLARGE_INTEGER,
+          PULONG);
+      static const TNtReadWriteFile ntReadFile =
+          reinterpret_cast<TNtReadWriteFile>(GetInternalWindowsApiFunctionAddress("NtReadFile"));
+      static const TNtReadWriteFile ntWriteFile =
+          reinterpret_cast<TNtReadWriteFile>(GetInternalWindowsApiFunctionAddress("NtWriteFile"));
+      if ((nullptr == ntReadFile) || (nullptr == ntWriteFile)) return NtStatus::kNotImplemented;
+
+      ENSURE_ABSOLUTE_PATH_PARAM_HAS_WINDOWS_NAMESPCE_PREFIX(absoluteSourcePath);
+      ENSURE_ABSOLUTE_PATH_PARAM_HAS_WINDOWS_NAMESPCE_PREFIX(absoluteDestinationPath);
+
+      // Open the source file for reading. Synchronous, non-directory, read-only.
+      UNICODE_STRING sourceSystemString =
+          Strings::NtConvertStringViewToUnicodeString(absoluteSourcePath);
+      OBJECT_ATTRIBUTES sourceObjectAttributes{};
+      InitializeObjectAttributes(
+          &sourceObjectAttributes, &sourceSystemString, 0, nullptr, nullptr);
+
+      HANDLE sourceHandle = nullptr;
+      IO_STATUS_BLOCK sourceStatusBlock{};
+      NTSTATUS openSourceResult = Hooks::ProtectedDependency::NtCreateFile::SafeInvoke(
+          &sourceHandle,
+          (FILE_READ_DATA | FILE_READ_ATTRIBUTES | SYNCHRONIZE),
+          &sourceObjectAttributes,
+          &sourceStatusBlock,
+          nullptr,
+          0,
+          (FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE),
+          FILE_OPEN,
+          (FILE_NON_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT),
+          nullptr,
+          0);
+      if (!(NT_SUCCESS(openSourceResult))) return openSourceResult;
+
+      // Capture source attributes and timestamps so they can be replicated on the destination.
+      SFileBasicInformation sourceBasicInformation{};
+      IO_STATUS_BLOCK basicInfoStatusBlock{};
+      NTSTATUS queryBasicInfoResult = Hooks::ProtectedDependency::NtQueryInformationFile::SafeInvoke(
+          sourceHandle,
+          &basicInfoStatusBlock,
+          &sourceBasicInformation,
+          sizeof(sourceBasicInformation),
+          SFileBasicInformation::kFileInformationClass);
+      const bool haveSourceBasicInformation = NT_SUCCESS(queryBasicInfoResult);
+
+      // Ensure the destination's parent directory hierarchy exists before creating the file.
+      const std::wstring_view destinationTrimmed =
+          Infra::Strings::RemoveTrailing(absoluteDestinationPath, L'\\');
+      const size_t destinationLastSeparator = destinationTrimmed.find_last_of(L'\\');
+      if (std::wstring_view::npos != destinationLastSeparator)
+      {
+        const std::wstring_view destinationParent =
+            destinationTrimmed.substr(0, destinationLastSeparator);
+        NTSTATUS createParentResult = CreateDirectoryHierarchy(destinationParent);
+        if (!(NT_SUCCESS(createParentResult)))
+        {
+          Hooks::ProtectedDependency::NtClose::SafeInvoke(sourceHandle);
+          return createParentResult;
+        }
+      }
+
+      // Create (overwriting any existing file) the destination for writing.
+      UNICODE_STRING destinationSystemString =
+          Strings::NtConvertStringViewToUnicodeString(absoluteDestinationPath);
+      OBJECT_ATTRIBUTES destinationObjectAttributes{};
+      InitializeObjectAttributes(
+          &destinationObjectAttributes, &destinationSystemString, 0, nullptr, nullptr);
+
+      const ULONG destinationAttributes =
+          (haveSourceBasicInformation && (0 != sourceBasicInformation.fileAttributes))
+          ? sourceBasicInformation.fileAttributes
+          : FILE_ATTRIBUTE_NORMAL;
+
+      HANDLE destinationHandle = nullptr;
+      IO_STATUS_BLOCK destinationStatusBlock{};
+      NTSTATUS openDestinationResult = Hooks::ProtectedDependency::NtCreateFile::SafeInvoke(
+          &destinationHandle,
+          (FILE_WRITE_DATA | FILE_WRITE_ATTRIBUTES | SYNCHRONIZE),
+          &destinationObjectAttributes,
+          &destinationStatusBlock,
+          nullptr,
+          destinationAttributes,
+          (FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE),
+          FILE_SUPERSEDE,
+          (FILE_NON_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT),
+          nullptr,
+          0);
+      if (!(NT_SUCCESS(openDestinationResult)))
+      {
+        Hooks::ProtectedDependency::NtClose::SafeInvoke(sourceHandle);
+        return openDestinationResult;
+      }
+
+      // Stream the file contents in fixed-size chunks until end-of-file is reached.
+      constexpr ULONG kCopyChunkBytes = 65536;
+      std::unique_ptr<uint8_t[]> copyBuffer = std::make_unique<uint8_t[]>(kCopyChunkBytes);
+      NTSTATUS copyResult = NtStatus::kSuccess;
+
+      while (true)
+      {
+        IO_STATUS_BLOCK readStatusBlock{};
+        NTSTATUS readResult = ntReadFile(
+            sourceHandle,
+            nullptr,
+            nullptr,
+            nullptr,
+            &readStatusBlock,
+            copyBuffer.get(),
+            kCopyChunkBytes,
+            nullptr,
+            nullptr);
+        if (kEndOfFile == readResult) break;
+        if (!(NT_SUCCESS(readResult)))
+        {
+          copyResult = readResult;
+          break;
+        }
+
+        const ULONG bytesRead = static_cast<ULONG>(readStatusBlock.Information);
+        if (0 == bytesRead) break;
+
+        ULONG bytesWrittenTotal = 0;
+        while (bytesWrittenTotal < bytesRead)
+        {
+          IO_STATUS_BLOCK writeStatusBlock{};
+          NTSTATUS writeResult = ntWriteFile(
+              destinationHandle,
+              nullptr,
+              nullptr,
+              nullptr,
+              &writeStatusBlock,
+              copyBuffer.get() + bytesWrittenTotal,
+              bytesRead - bytesWrittenTotal,
+              nullptr,
+              nullptr);
+          if (!(NT_SUCCESS(writeResult)))
+          {
+            copyResult = writeResult;
+            break;
+          }
+
+          const ULONG bytesWritten = static_cast<ULONG>(writeStatusBlock.Information);
+          if (0 == bytesWritten)
+          {
+            copyResult = NtStatus::kInternalError;
+            break;
+          }
+          bytesWrittenTotal += bytesWritten;
+        }
+
+        if (!(NT_SUCCESS(copyResult))) break;
+      }
+
+      // Replicate source attributes and timestamps onto the destination on success.
+      if (NT_SUCCESS(copyResult) && haveSourceBasicInformation)
+      {
+        SFileBasicInformation destinationBasicInformation = sourceBasicInformation;
+        IO_STATUS_BLOCK setInfoStatusBlock{};
+        Hooks::ProtectedDependency::NtSetInformationFile::SafeInvoke(
+            destinationHandle,
+            &setInfoStatusBlock,
+            &destinationBasicInformation,
+            sizeof(destinationBasicInformation),
+            SFileBasicInformation::kFileInformationClass);
+      }
+
+      Hooks::ProtectedDependency::NtClose::SafeInvoke(destinationHandle);
+      Hooks::ProtectedDependency::NtClose::SafeInvoke(sourceHandle);
+
+      // If the copy failed after the destination was created, remove the partial destination so
+      // that no truncated file is left behind for redirection to open.
+      if (!(NT_SUCCESS(copyResult))) Delete(absoluteDestinationPath);
+
+      return copyResult;
     }
 
     NTSTATUS CreateDirectoryHierarchy(std::wstring_view absoluteDirectoryPath)

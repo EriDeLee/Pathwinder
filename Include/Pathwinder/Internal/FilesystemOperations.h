@@ -29,6 +29,21 @@ namespace Pathwinder
     /// @return Result of the underlying system call that closes the handle.
     NTSTATUS CloseHandle(HANDLE handle);
 
+    /// Copies the contents and basic metadata (attributes and timestamps) of a single existing
+    /// file to a destination path. Both paths are used verbatim, without any filesystem
+    /// redirection, so callers must supply fully-resolved absolute paths. All internal system
+    /// calls bypass Pathwinder's own hooks, so this function is safe to call from within
+    /// redirection logic without causing re-entrancy. Any missing ancestor directories of the
+    /// destination are created. An existing destination file is overwritten. This is the
+    /// primitive used to implement copy-up: materializing an origin-side (for example, C:) file
+    /// on the target side (for example, D:) before a write is permitted to proceed, so that the
+    /// origin side is never modified.
+    /// @param [in] absoluteSourcePath Absolute path of the existing file to copy from.
+    /// @param [in] absoluteDestinationPath Absolute path of the file to create or overwrite.
+    /// @return System call return code indicating the result of the operation.
+    NTSTATUS CopySingleFile(
+        std::wstring_view absoluteSourcePath, std::wstring_view absoluteDestinationPath);
+
     /// Attempts to create the specified directory if it does not already exist.
     /// If needed, also attempts to create all directories that are ancestors of the specified
     /// directory.
