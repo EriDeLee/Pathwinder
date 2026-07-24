@@ -783,6 +783,20 @@ namespace Pathwinder
     {
       NTSTATUS extraPreOperationResult = NtStatus::kSuccess;
 
+      // Checked first: if redirection determined the operation cannot be completed safely, fail it
+      // now with file-not-found so no file is opened or created (and no empty file is left behind
+      // to shadow origin-side content).
+      if (instruction.GetExtraPreOperations().contains(
+              static_cast<int>(EExtraPreOperation::FailOperationObjectNotFound)))
+      {
+        Infra::Message::OutputFormatted(
+            Infra::Message::ESeverity::Debug,
+            L"%s(%u): Forcing STATUS_OBJECT_NAME_NOT_FOUND because redirection could not be completed safely.",
+            functionName,
+            functionRequestIdentifier);
+        return NtStatus::kObjectNameNotFound;
+      }
+
       if (instruction.GetExtraPreOperations().contains(
               static_cast<int>(EExtraPreOperation::EnsurePathHierarchyExists)) &&
           (NT_SUCCESS(extraPreOperationResult)))

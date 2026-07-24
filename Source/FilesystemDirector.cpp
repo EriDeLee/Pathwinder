@@ -824,11 +824,19 @@ namespace Pathwinder
 
       if (true == writeOrDeleteIntent)
       {
+        // Resolve origin-side existence and type once; both copy-up and whiteout arming below
+        // must treat directories differently from regular files.
+        const bool unredirectedExists =
+            FilesystemOperations::Exists(unredirectedFilePathTrimmed);
+        const bool unredirectedIsDirectory =
+            unredirectedExists && FilesystemOperations::IsDirectory(unredirectedFilePathTrimmed);
+        bool copyUpFailed = false;
+
         // Copy-up. Skipped when tombstoned so a logically-deleted path is never resurrected from
-        // origin content, and skipped for directories (handled by EnsurePathHierarchyExists).
-        if ((false == redirectedExists) && (false == tombstoned) &&
-            (true == FilesystemOperations::Exists(unredirectedFilePathTrimmed)) &&
-            (false == FilesystemOperations::IsDirectory(unredirectedFilePathTrimmed)))
+        // origin content, and skipped for directories (their target-side hierarchy is handled by
+        // EnsurePathHierarchyExists; only regular-file contents are copied up).
+        if ((false == redirectedExists) && (false == tombstoned) && (true == unredirectedExists) &&
+            (false == unredirectedIsDirectory))
         {
           NTSTATUS copyUpResult = FilesystemOperations::CopySingleFile(
               unredirectedFilePathTrimmed, redirectedFilePathTrimmed);
@@ -844,12 +852,16 @@ namespace Pathwinder
           }
           else
           {
-            // Even if copy-up fails, still fall through to target-only redirection below so the
-            // origin side is never opened for writing. The application will observe whatever
-            // error results from operating on the target side.
+            // Copy-up failed. The origin side must never be modified, but the operation must also
+            // not be allowed to fall through and create a fresh empty file on the target side that
+            // would shadow the still-present origin content. Force the operation to fail with
+            // file-not-found instead. CopySingleFile already removes any partial destination.
+            extraPreOperations.insert(
+                static_cast<int>(EExtraPreOperation::FailOperationObjectNotFound));
+            copyUpFailed = true;
             Infra::Message::OutputFormatted(
                 Infra::Message::ESeverity::Warning,
-                L"File operation redirection query for path \"%.*s\" attempted copy-up to \"%.*s\" but it failed with code 0x%08x; the operation will proceed on the target side only.",
+                L"File operation redirection query for path \"%.*s\" attempted copy-up to \"%.*s\" but it failed with code 0x%08x; the operation will be failed with file-not-found so the origin side is neither modified nor shadowed.",
                 static_cast<int>(absoluteFilePath.length()),
                 absoluteFilePath.data(),
                 static_cast<int>(redirectedFilePathTrimmed.length()),
@@ -858,11 +870,15 @@ namespace Pathwinder
           }
         }
 
-        // Drop a latent whiteout marker when a delete-capable operation targets a file that is
-        // present on the origin side. Only origin-present files need a tombstone, because a file
-        // that exists only on the target side leaves nothing behind to hide when deleted.
-        if ((true == fileAccessMode.AllowsDelete()) &&
-            (true == FilesystemOperations::Exists(unredirectedFilePathTrimmed)))
+        // Drop a latent whiteout marker when a delete-capable operation targets a regular file
+        // present on the origin side. Directories are excluded: a file-named marker cannot
+        // correctly represent a deleted directory, and copy-up does not materialize directory
+        // contents, so a directory delete is left to fail on the (non-existent) target side rather
+        // than falsely hiding the origin directory. Also skipped when copy-up just failed: no
+        // target-side file exists in that case, so a marker would become an immediately-active
+        // tombstone that permanently hides the still-present origin file.
+        if ((true == fileAccessMode.AllowsDelete()) && (true == unredirectedExists) &&
+            (false == unredirectedIsDirectory) && (false == copyUpFailed))
         {
           NTSTATUS whiteoutResult =
               FilesystemOperations::CreateEmptyFile(whiteoutPath.AsStringView());

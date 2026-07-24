@@ -98,6 +98,12 @@ namespace Pathwinder
     /// extra operand.
     EnsurePathHierarchyExists,
 
+    /// Force the operation to fail with STATUS_OBJECT_NAME_NOT_FOUND before any file is opened or
+    /// created. Used when redirection cannot be completed safely (for example, a copy-up that
+    /// failed) and the operation must not be allowed to fall through to creating an empty file
+    /// that would shadow origin-side content. Takes no operand.
+    FailOperationObjectNotFound,
+
     /// Not used as a value. Identifies the number of enumerators present in this enumeration.
     Count
   };
